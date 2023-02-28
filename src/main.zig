@@ -366,13 +366,23 @@ const Poly = struct {
         return ret;
     }
 
-    // For testing, generates a random polynomial polynomial with for each
+    // For testing, generates a random polynomial with for each
     // coefficient |x| ≤ q.
     fn randAbsLeqQ(rnd: anytype) Poly {
         var ret: Poly = undefined;
         var i: usize = 0;
         while (i < N) : (i += 1) {
             ret.cs[i] = rnd.random().intRangeAtMost(i16, -Q, Q);
+        }
+        return ret;
+    }
+
+    // For testing, generates a random normalized polynomial.
+    fn randNormalized(rnd: anytype) Poly {
+        var ret: Poly = undefined;
+        var i: usize = 0;
+        while (i < N) : (i += 1) {
+            ret.cs[i] = rnd.random().intRangeLessThan(i16, 0, Q);
         }
         return ret;
     }
@@ -548,7 +558,8 @@ const Poly = struct {
     // Returns packed Compress_q(p, d).
     //
     // Assumes p is normalized.
-    fn compress(p: Poly, comptime d: u8) [@divTrunc(N * 8, d)]u8 {
+    fn compress(p: Poly, comptime d: u8) [@divTrunc(N * d, 8)]u8 {
+        @setEvalBranchQuota(10000);
         // First we compress into in.
         const Qover2: u32 = comptime @divTrunc(Q, 2); // (q-1)/2
         const twoDm1: u32 = comptime (1 << d) - 1; // 2ᵈ-1
@@ -560,13 +571,13 @@ const Poly = struct {
             //                  = ⌊(2ᵈ/q)x+½⌋ mod⁺ 2ᵈ
             //                  = ⌊((x << d) + q/2) / q⌋ mod⁺ 2ᵈ
             //                  = DIV((x << d) + q/2, q) & ((1<<d) - 1)
-            in[i] = @divFloor((@intCast(u32, p.cs[i]) << d) + Qover2, Q) & twoDm1;
+            in[i] = @intCast(u16, @divFloor((@intCast(u32, p.cs[i]) << d) + Qover2, Q) & twoDm1);
         }
 
         // Now we pack the d-bit integers in `in' into out as bytes.
-        const outLen: usize = comptime @divTrunc(N * 8, d);
-        comptime assert(outLen * d == 8 * N);
-        var out: [outLen]u8 = undefined;
+        const outLen: usize = comptime @divTrunc(N * d, 8);
+        comptime assert(outLen * 8 == d * N);
+        var out = std.mem.zeroes([outLen]u8);
         comptime var inShift: usize = 0;
         comptime var j: usize = 0;
         i = 0;
@@ -574,7 +585,7 @@ const Poly = struct {
             comptime var todo: usize = 8;
             inline while (todo > 0) {
                 const outShift: usize = comptime 8 - todo;
-                out[j] |= (in[i] >> inShift) << outShift;
+                out[j] |= @truncate(u8, (in[i] >> inShift) << outShift);
 
                 const done: usize = comptime @min(@min(d, todo), d - inShift);
                 todo -= done;
@@ -582,7 +593,7 @@ const Poly = struct {
 
                 if (inShift == d) {
                     inShift = 0;
-                    i += i;
+                    i += 1;
                 }
             }
         }
@@ -591,7 +602,56 @@ const Poly = struct {
     }
 
     // Set p to Decompress_q(m, d).
-    fn decompress(x: [@divTrunc(N * 8, d)]u8, comptime d: u8) Poly {}
+    fn decompress(comptime d: u8, in: [@divTrunc(N * d, 8)]u8) Poly {
+        @setEvalBranchQuota(10000);
+        comptime var i: usize = 0;
+        comptime var j: usize = 0;
+        comptime var inShift: usize = 0;
+        const inLen: usize = comptime @divTrunc(N * d, 8);
+        comptime assert(inLen * 8 == d * N);
+        var ret: Poly = undefined;
+
+        inline while (i < N) : (i += 1) {
+            // First, unpack next coefficient.
+            comptime var todo: usize = d;
+            var out: u16 = 0;
+
+            inline while (todo > 0) {
+                const outShift: usize = comptime d - todo;
+                out |= (@as(u16, in[j] >> inShift) << outShift) & comptime (1 << d) - 1;
+
+                const done: usize = comptime @min(@min(8, todo), 8 - inShift);
+                todo -= done;
+                inShift += done;
+
+                if (inShift == 8) {
+                    inShift = 0;
+                    j += 1;
+                }
+            }
+
+            // Decompress_q(x, d) = ⌈(q/2ᵈ)x⌋
+            //                    = ⌊(q/2ᵈ)x+½⌋
+            //                    = ⌊(qx + 2ᵈ⁻¹)/2ᵈ⌋
+            //                    = (qx + (1<<(d-1))) >> d
+            ret.cs[i] = @intCast(i16, (@as(u32, out) * @as(u32, Q) + (1 << (d - 1))) >> d);
+        }
+
+        return ret;
+    }
+
+    test "Compression" {
+        var rnd = RndGen.init(0);
+        inline for (.{ 1, 4, 5, 10, 11 }) |d| {
+            var k: i32 = 0;
+            while (k <= 1000) : (k += 1) {
+                const p = Poly.randNormalized(&rnd);
+                const pp = p.compress(d);
+                const pq = Poly.decompress(d, pp).compress(d);
+                try testing.expectEqual(pp, pq);
+            }
+        }
+    }
 };
 
 test "NTT" {
