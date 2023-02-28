@@ -13,6 +13,43 @@ const R: i32 = 1 << 16;
 // Parameter n, degree of polynomials.
 const N: i32 = 256;
 
+const Params = struct {
+    // Width and height of the matrix A.
+    k: u8,
+
+    // Size of "small" vectors used in noise vector for encryption.
+    eta1: u8,
+
+    // How many bits to retain of u, the private-key independent part
+    // of the ciphertext.
+    du: u8,
+
+    // How many bits to retain of v, the private-key dependent part
+    // of the ciphertext.
+    dv: u8,
+};
+
+const Kyber512: Params = .{
+    .k = 2,
+    .eta1 = 3,
+    .du = 10,
+    .dv = 4,
+};
+
+const Kyber768: Params = .{
+    .k = 3,
+    .eta1 = 2,
+    .du = 10,
+    .dv = 4,
+};
+
+const Kyber1024: Params = .{
+    .k = 4,
+    .eta1 = 2,
+    .du = 11,
+    .dv = 5,
+};
+
 // R mod q
 const RModQ: i32 = @rem(@as(i32, R), Q);
 
@@ -507,6 +544,54 @@ const Poly = struct {
         }
         return ret;
     }
+
+    // Returns packed Compress_q(p, d).
+    //
+    // Assumes p is normalized.
+    fn compress(p: Poly, comptime d: u8) [@divTrunc(N * 8, d)]u8 {
+        // First we compress into in.
+        const Qover2: u32 = comptime @divTrunc(Q, 2); // (q-1)/2
+        const twoDm1: u32 = comptime (1 << d) - 1; // 2ᵈ-1
+        comptime var i: usize = 0;
+        var in: [N]u16 = undefined;
+
+        inline while (i < N) : (i += 1) {
+            // Compress_q(x, d) = ⌈(2ᵈ/q)x⌋ mod⁺ 2ᵈ
+            //                  = ⌊(2ᵈ/q)x+½⌋ mod⁺ 2ᵈ
+            //                  = ⌊((x << d) + q/2) / q⌋ mod⁺ 2ᵈ
+            //                  = DIV((x << d) + q/2, q) & ((1<<d) - 1)
+            in[i] = @divFloor((@intCast(u32, p.cs[i]) << d) + Qover2, Q) & twoDm1;
+        }
+
+        // Now we pack the d-bit integers in `in' into out as bytes.
+        const outLen: usize = comptime @divTrunc(N * 8, d);
+        comptime assert(outLen * d == 8 * N);
+        var out: [outLen]u8 = undefined;
+        comptime var inShift: usize = 0;
+        comptime var j: usize = 0;
+        i = 0;
+        inline while (j < outLen) : (j += 1) {
+            comptime var todo: usize = 8;
+            inline while (todo > 0) {
+                const outShift: usize = comptime 8 - todo;
+                out[j] |= (in[i] >> inShift) << outShift;
+
+                const done: usize = comptime @min(@min(d, todo), d - inShift);
+                todo -= done;
+                inShift += done;
+
+                if (inShift == d) {
+                    inShift = 0;
+                    i += i;
+                }
+            }
+        }
+
+        return out;
+    }
+
+    // Set p to Decompress_q(m, d).
+    fn decompress(x: [@divTrunc(N * 8, d)]u8, comptime d: u8) Poly {}
 };
 
 test "NTT" {
@@ -533,4 +618,39 @@ test "NTT" {
 
         try testing.expectEqual(p, q);
     }
+}
+
+// A vector of K polynomials.
+fn Vec(comptime K: u8) type {
+    return struct {
+        const Self = @This();
+        ps: [K]Poly,
+
+        fn ntt(a: Self) Self {
+            var ret: Self = undefined;
+            comptime var i = 0;
+            inline while (i < K) : (i += 1) {
+                ret.ps[i] = a.ps[i].ntt();
+            }
+            return ret;
+        }
+
+        fn add(a: Self, b: Self) Self {
+            var ret: Self = undefined;
+            comptime var i = 0;
+            inline while (i < K) : (i += 1) {
+                ret.ps[i] = a.ps[i].add(b.ps[i]);
+            }
+            return ret;
+        }
+
+        fn sub(a: Self, b: Self) Self {
+            var ret: Self = undefined;
+            comptime var i = 0;
+            inline while (i < K) : (i += 1) {
+                ret.ps[i] = a.ps[i].sub(b.ps[i]);
+            }
+            return ret;
+        }
+    };
 }
