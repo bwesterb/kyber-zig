@@ -166,6 +166,12 @@ fn eeaResult(comptime T: type) type {
     return struct { gcd: T, x: T, y: T };
 }
 
+// Returns least common multiple of a and b.
+fn lcm(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    const r = eea(a, b);
+    return a * b / r.gcd;
+}
+
 // Invert modulo p.
 fn invertMod(a: anytype, p: @TypeOf(a)) @TypeOf(a) {
     const r = eea(a, p);
@@ -563,39 +569,51 @@ const Poly = struct {
         // First we compress into in.
         const Qover2: u32 = comptime @divTrunc(Q, 2); // (q-1)/2
         const twoDm1: u32 = comptime (1 << d) - 1; // 2ᵈ-1
-        comptime var i: usize = 0;
-        var in: [N]u16 = undefined;
+        var inOff: usize = 0;
+        var outOff: usize = 0;
 
-        inline while (i < N) : (i += 1) {
-            // Compress_q(x, d) = ⌈(2ᵈ/q)x⌋ mod⁺ 2ᵈ
-            //                  = ⌊(2ᵈ/q)x+½⌋ mod⁺ 2ᵈ
-            //                  = ⌊((x << d) + q/2) / q⌋ mod⁺ 2ᵈ
-            //                  = DIV((x << d) + q/2, q) & ((1<<d) - 1)
-            in[i] = @intCast(u16, @divFloor((@intCast(u32, p.cs[i]) << d) + Qover2, Q) & twoDm1);
-        }
+        const batchSize: usize = comptime lcm(@as(i16, d), 8);
+        const inBatchSize: usize = comptime batchSize / d;
+        const outBatchSize: usize = comptime batchSize / 8;
 
-        // Now we pack the d-bit integers in `in' into out as bytes.
         const outLen: usize = comptime @divTrunc(N * d, 8);
         comptime assert(outLen * 8 == d * N);
         var out = std.mem.zeroes([outLen]u8);
-        comptime var inShift: usize = 0;
-        comptime var j: usize = 0;
-        i = 0;
-        inline while (j < outLen) : (j += 1) {
-            comptime var todo: usize = 8;
-            inline while (todo > 0) {
-                const outShift: usize = comptime 8 - todo;
-                out[j] |= @truncate(u8, (in[i] >> inShift) << outShift);
 
-                const done: usize = comptime @min(@min(d, todo), d - inShift);
-                todo -= done;
-                inShift += done;
+        while (inOff < N) {
+            var in: [inBatchSize]u16 = undefined;
+            comptime var i: usize = 0;
+            inline while (i < inBatchSize) : (i += 1) {
+                // Compress_q(x, d) = ⌈(2ᵈ/q)x⌋ mod⁺ 2ᵈ
+                //                  = ⌊(2ᵈ/q)x+½⌋ mod⁺ 2ᵈ
+                //                  = ⌊((x << d) + q/2) / q⌋ mod⁺ 2ᵈ
+                //                  = DIV((x << d) + q/2, q) & ((1<<d) - 1)
+                in[i] = @intCast(u16, @divFloor((@intCast(u32, p.cs[inOff + i]) << d) + Qover2, Q) & twoDm1);
+            }
 
-                if (inShift == d) {
-                    inShift = 0;
-                    i += 1;
+            // Now we pack the d-bit integers in `in' into out as bytes.
+            comptime var inShift: usize = 0;
+            comptime var j: usize = 0;
+            i = 0;
+            inline while (i < inBatchSize) : (j += 1) {
+                comptime var todo: usize = 8;
+                inline while (todo > 0) {
+                    const outShift: usize = comptime 8 - todo;
+                    out[outOff + j] |= @truncate(u8, (in[i] >> inShift) << outShift);
+
+                    const done: usize = comptime @min(@min(d, todo), d - inShift);
+                    todo -= done;
+                    inShift += done;
+
+                    if (inShift == d) {
+                        inShift = 0;
+                        i += 1;
+                    }
                 }
             }
+
+            inOff += inBatchSize;
+            outOff += outBatchSize;
         }
 
         return out;
@@ -604,37 +622,48 @@ const Poly = struct {
     // Set p to Decompress_q(m, d).
     fn decompress(comptime d: u8, in: [@divTrunc(N * d, 8)]u8) Poly {
         @setEvalBranchQuota(10000);
-        comptime var i: usize = 0;
-        comptime var j: usize = 0;
-        comptime var inShift: usize = 0;
         const inLen: usize = comptime @divTrunc(N * d, 8);
         comptime assert(inLen * 8 == d * N);
         var ret: Poly = undefined;
+        var inOff: usize = 0;
+        var outOff: usize = 0;
 
-        inline while (i < N) : (i += 1) {
-            // First, unpack next coefficient.
-            comptime var todo: usize = d;
-            var out: u16 = 0;
+        const batchSize: usize = comptime lcm(@as(i16, d), 8);
+        const inBatchSize: usize = comptime batchSize / 8;
+        const outBatchSize: usize = comptime batchSize / d;
 
-            inline while (todo > 0) {
-                const outShift: usize = comptime d - todo;
-                out |= (@as(u16, in[j] >> inShift) << outShift) & comptime (1 << d) - 1;
+        while (outOff < N) {
+            comptime var inShift: usize = 0;
+            comptime var j: usize = 0;
+            comptime var i: usize = 0;
+            inline while (i < outBatchSize) : (i += 1) {
+                // First, unpack next coefficient.
+                comptime var todo: usize = d;
+                var out: u16 = 0;
 
-                const done: usize = comptime @min(@min(8, todo), 8 - inShift);
-                todo -= done;
-                inShift += done;
+                inline while (todo > 0) {
+                    const outShift: usize = comptime d - todo;
+                    out |= (@as(u16, in[inOff + j] >> inShift) << outShift) & comptime (1 << d) - 1;
 
-                if (inShift == 8) {
-                    inShift = 0;
-                    j += 1;
+                    const done: usize = comptime @min(@min(8, todo), 8 - inShift);
+                    todo -= done;
+                    inShift += done;
+
+                    if (inShift == 8) {
+                        inShift = 0;
+                        j += 1;
+                    }
                 }
+
+                // Decompress_q(x, d) = ⌈(q/2ᵈ)x⌋
+                //                    = ⌊(q/2ᵈ)x+½⌋
+                //                    = ⌊(qx + 2ᵈ⁻¹)/2ᵈ⌋
+                //                    = (qx + (1<<(d-1))) >> d
+                ret.cs[outOff + i] = @intCast(i16, (@as(u32, out) * @as(u32, Q) + (1 << (d - 1))) >> d);
             }
 
-            // Decompress_q(x, d) = ⌈(q/2ᵈ)x⌋
-            //                    = ⌊(q/2ᵈ)x+½⌋
-            //                    = ⌊(qx + 2ᵈ⁻¹)/2ᵈ⌋
-            //                    = (qx + (1<<(d-1))) >> d
-            ret.cs[i] = @intCast(i16, (@as(u32, out) * @as(u32, Q) + (1 << (d - 1))) >> d);
+            inOff += inBatchSize;
+            outOff += outBatchSize;
         }
 
         return ret;
