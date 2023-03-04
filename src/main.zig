@@ -217,7 +217,8 @@ fn montReduce(x: i32) i16 {
     //
     // and as both 2¹⁵ q ≤ m q, x < 2¹⁵ q, we have
     // 2¹⁶ q ≤ x - m q < 2¹⁶ and so q ≤ (x - m q) / R < q as desired.
-    return @bitCast(i16, @truncate(u16, @bitCast(u32, x - @as(i32, m) * @as(i32, Q)) >> 16));
+    const yR = x - @as(i32, m) * @as(i32, Q);
+    return @bitCast(i16, @truncate(u16, @bitCast(u32, yR) >> 16));
 }
 
 test "Test montReduce" {
@@ -249,9 +250,9 @@ test "Test feToMont" {
 
 // Given any x, compute 0 ≤ y ≤ q with x = y (mod q).
 //
-// Beware: we might have barrettReduce(x) = q ≠ 0 for some x.  In fact,
+// Beware: we might have feBarrettReduce(x) = q ≠ 0 for some x.  In fact,
 // this happens if and only if x = -nq for some positive integer n.
-fn barrettReduce(x: i16) i16 {
+fn feBarrettReduce(x: i16) i16 {
     // This is standard Barrett reduction.
     //
     // For any x we have x mod q = x - ⌊x/q⌋ q.  We will use 20159/2²⁶ as
@@ -272,10 +273,10 @@ fn barrettReduce(x: i16) i16 {
     return x -% @intCast(i16, (@as(i32, x) * 20159) >> 26) *% Q;
 }
 
-test "Test Barrett reduce" {
+test "Test Barrett reduction" {
     var x: i32 = -(1 << 15);
     while (x < 1 << 15) : (x += 1) {
-        var y1: i16 = barrettReduce(@intCast(i16, x));
+        var y1: i16 = feBarrettReduce(@intCast(i16, x));
         var y2: i16 = @mod(@intCast(i16, x), Q);
         if (x < 0 and @rem(-x, Q) == 0) {
             y1 -= Q;
@@ -339,7 +340,8 @@ fn computeZetas() [128]i16 {
     var ret: [128]i16 = undefined;
     var i: i32 = 0;
     while (i < 128) : (i += 1) {
-        ret[@intCast(usize, i)] = csubq(barrettReduce(feToMont(@intCast(i16, mpow(@as(i32, zeta), brv(i, 7), Q)))));
+        const t = @intCast(i16, mpow(@as(i32, zeta), brv(i, 7), Q));
+        ret[@intCast(usize, i)] = csubq(feBarrettReduce(feToMont(t)));
     }
     return ret;
 }
@@ -356,8 +358,8 @@ const Poly = struct {
 
     fn add(a: Poly, b: Poly) Poly {
         var ret: Poly = undefined;
-        comptime var i = 0;
-        inline while (i < N) : (i += 1) {
+        var i = 0;
+        while (i < N) : (i += 1) {
             ret.cs[i] = a.cs[i] + b.cs[i];
         }
         return ret;
@@ -365,8 +367,8 @@ const Poly = struct {
 
     fn sub(a: Poly, b: Poly) Poly {
         var ret: Poly = undefined;
-        comptime var i = 0;
-        inline while (i < N) : (i += 1) {
+        var i = 0;
+        while (i < N) : (i += 1) {
             ret.cs[i] = a.cs[i] - b.cs[i];
         }
         return ret;
@@ -524,7 +526,7 @@ const Poly = struct {
                 if (i < 0) {
                     break;
                 }
-                p.cs[@intCast(usize, i)] = barrettReduce(p.cs[@intCast(usize, i)]);
+                p.cs[@intCast(usize, i)] = feBarrettReduce(p.cs[@intCast(usize, i)]);
             }
         }
 
@@ -544,9 +546,9 @@ const Poly = struct {
     // Ensures each coefficient is in {0, …, q-1}.
     fn normalize(a: Poly) Poly {
         var ret: Poly = undefined;
-        comptime var i = 0;
-        inline while (i < N) : (i += 1) {
-            ret.cs[i] = csubq(barrettReduce(a.cs[i]));
+        var i: usize = 0;
+        while (i < N) : (i += 1) {
+            ret.cs[i] = csubq(feBarrettReduce(a.cs[i]));
         }
         return ret;
     }
@@ -554,9 +556,21 @@ const Poly = struct {
     // Put p in Montgomery form.
     fn toMont(a: Poly) Poly {
         var ret: Poly = undefined;
-        comptime var i = 0;
-        inline while (i < N) : (i += 1) {
+        var i: usize = 0;
+        while (i < N) : (i += 1) {
             ret.cs[i] = feToMont(a.cs[i]);
+        }
+        return ret;
+    }
+
+    // Barret reduce coefficients.
+    //
+    // Beware, this does not fully normalize coefficients.
+    fn barrettReduce(a: Poly) Poly {
+        var ret: Poly = undefined;
+        var i: usize = 0;
+        while (i < N) : (i += 1) {
+            ret.cs[i] = feBarrettReduce(a.cs[i]);
         }
         return ret;
     }
@@ -566,7 +580,6 @@ const Poly = struct {
     // Assumes p is normalized.
     fn compress(p: Poly, comptime d: u8) [@divTrunc(N * d, 8)]u8 {
         @setEvalBranchQuota(10000);
-        // First we compress into in.
         const Qover2: u32 = comptime @divTrunc(Q, 2); // (q-1)/2
         const twoDm1: u32 = comptime (1 << d) - 1; // 2ᵈ-1
         var inOff: usize = 0;
@@ -581,6 +594,7 @@ const Poly = struct {
         var out = std.mem.zeroes([outLen]u8);
 
         while (inOff < N) {
+            // First we compress into in.
             var in: [inBatchSize]u16 = undefined;
             comptime var i: usize = 0;
             inline while (i < inBatchSize) : (i += 1) {
@@ -588,10 +602,11 @@ const Poly = struct {
                 //                  = ⌊(2ᵈ/q)x+½⌋ mod⁺ 2ᵈ
                 //                  = ⌊((x << d) + q/2) / q⌋ mod⁺ 2ᵈ
                 //                  = DIV((x << d) + q/2, q) & ((1<<d) - 1)
-                in[i] = @intCast(u16, @divFloor((@intCast(u32, p.cs[inOff + i]) << d) + Qover2, Q) & twoDm1);
+                const t = @intCast(u32, p.cs[inOff + i]) << d;
+                in[i] = @intCast(u16, @divFloor(t + Qover2, Q) & twoDm1);
             }
 
-            // Now we pack the d-bit integers in `in' into out as bytes.
+            // Now we pack the d-bit integers from `in' into out as bytes.
             comptime var inShift: usize = 0;
             comptime var j: usize = 0;
             i = 0;
@@ -643,7 +658,8 @@ const Poly = struct {
 
                 inline while (todo > 0) {
                     const outShift: usize = comptime d - todo;
-                    out |= (@as(u16, in[inOff + j] >> inShift) << outShift) & comptime (1 << d) - 1;
+                    const m = comptime (1 << d) - 1;
+                    out |= (@as(u16, in[inOff + j] >> inShift) << outShift) & m;
 
                     const done: usize = comptime @min(@min(8, todo), 8 - inShift);
                     todo -= done;
@@ -659,7 +675,8 @@ const Poly = struct {
                 //                    = ⌊(q/2ᵈ)x+½⌋
                 //                    = ⌊(qx + 2ᵈ⁻¹)/2ᵈ⌋
                 //                    = (qx + (1<<(d-1))) >> d
-                ret.cs[outOff + i] = @intCast(i16, (@as(u32, out) * @as(u32, Q) + (1 << (d - 1))) >> d);
+                const qx = @as(u32, out) * @as(u32, Q);
+                ret.cs[outOff + i] = @intCast(i16, (qx + (1 << (d - 1))) >> d);
             }
 
             inOff += inBatchSize;
@@ -669,19 +686,123 @@ const Poly = struct {
         return ret;
     }
 
-    test "Compression" {
-        var rnd = RndGen.init(0);
-        inline for (.{ 1, 4, 5, 10, 11 }) |d| {
-            var k: i32 = 0;
-            while (k <= 1000) : (k += 1) {
-                const p = Poly.randNormalized(&rnd);
-                const pp = p.compress(d);
-                const pq = Poly.decompress(d, pp).compress(d);
-                try testing.expectEqual(pp, pq);
-            }
+    // Returns the "pointwise" multiplication a o b.
+    //
+    // That is: invNTT(a o b) = invNTT(a) * invNTT(b).  Assumes a and b are in
+    // Montgomery form.  Products between coefficients of a and b must be strictly
+    // bounded in absolute value by 2¹⁵q.  a o b will be in Montgomery form and
+    // bounded in absolute value by 2q.
+    fn mulHat(a: Poly, b: Poly) Poly {
+        // Recall from the discussion in ntt(), that a transformed polynomial is
+        // an element of ℤ_q[x]/(x²-ζ) x … x  ℤ_q[x]/(x²+ζ¹²⁷);
+        // that is: 128 degree-one polynomials instead of simply 256 elements
+        // from ℤ_q as in the regular NTT.  So instead of pointwise multiplication,
+        // we multiply the 128 pairs of degree-one polynomials modulo the
+        // right equation:
+        //
+        //  (a₁ + a₂x)(b₁ + b₂x) = a₁b₁ + a₂b₂ζ' + (a₁b₂ + a₂b₁)x,
+        //
+        // where ζ' is the appropriate power of ζ.
+
+        var p: Poly = undefined;
+        var k: usize = 64;
+        var i: usize = 0;
+        while (i < N) : (i += 4) {
+            const z = @as(i32, zetas[k]);
+            k += 1;
+
+            const a1b1 = montReduce(@as(i32, a.cs[i + 1]) * @as(i32, b.cs[i + 1]));
+            const a0b0 = montReduce(@as(i32, a.cs[i]) * @as(i32, b.cs[i]));
+            const a1b0 = montReduce(@as(i32, a.cs[i + 1]) * @as(i32, b.cs[i]));
+            const a0b1 = montReduce(@as(i32, a.cs[i]) * @as(i32, b.cs[i + 1]));
+
+            p.cs[i] = montReduce(a1b1 * z) + a0b0;
+            p.cs[i + 1] = a0b1 + a1b0;
+
+            const a3b3 = montReduce(@as(i32, a.cs[i + 3]) * @as(i32, b.cs[i + 3]));
+            const a2b2 = montReduce(@as(i32, a.cs[i + 2]) * @as(i32, b.cs[i + 2]));
+            const a3b2 = montReduce(@as(i32, a.cs[i + 3]) * @as(i32, b.cs[i + 2]));
+            const a2b3 = montReduce(@as(i32, a.cs[i + 2]) * @as(i32, b.cs[i + 3]));
+
+            p.cs[i + 2] = a2b2 - montReduce(a3b3 * z);
+            p.cs[i + 3] = a2b3 + a3b2;
         }
+
+        return p;
     }
 };
+
+// A vector of K polynomials.
+fn Vec(comptime K: u8) type {
+    return struct {
+        const Self = @This();
+        ps: [K]Poly,
+
+        fn ntt(a: Self) Self {
+            var ret: Self = undefined;
+            var i = 0;
+            while (i < K) : (i += 1) {
+                ret.ps[i] = a.ps[i].ntt();
+            }
+            return ret;
+        }
+
+        fn add(a: Self, b: Self) Self {
+            var ret: Self = undefined;
+            var i = 0;
+            while (i < K) : (i += 1) {
+                ret.ps[i] = a.ps[i].add(b.ps[i]);
+            }
+            return ret;
+        }
+
+        fn sub(a: Self, b: Self) Self {
+            var ret: Self = undefined;
+            var i = 0;
+            while (i < K) : (i += 1) {
+                ret.ps[i] = a.ps[i].sub(b.ps[i]);
+            }
+            return ret;
+        }
+    };
+}
+
+test "mulHat" {
+    var rnd = RndGen.init(0);
+    var t: i32 = 0;
+
+    while (t <= 1000) : (t += 1) {
+        const a = Poly.randAbsLeqQ(&rnd);
+        var b = Poly.randAbsLeqQ(&rnd);
+
+        const p2 = a.ntt().mulHat(b.ntt()).barrettReduce().invNTT().normalize();
+        var p: Poly = undefined;
+
+        var i: usize = 0;
+        while (i < N) : (i += 1) {
+            p.cs[i] = 0;
+        }
+
+        i = 0;
+        while (i < N) : (i += 1) {
+            var j: usize = 0;
+            while (j < N) : (j += 1) {
+                var v = montReduce(@as(i32, a.cs[i]) * @as(i32, b.cs[j]));
+                var k = i + j;
+                if (k >= N) {
+                    // Recall Xᴺ = -1.
+                    k -= N;
+                    v = -v;
+                }
+                p.cs[k] = feBarrettReduce(v + p.cs[k]);
+            }
+        }
+
+        p = p.toMont().normalize();
+
+        try testing.expectEqual(p, p2);
+    }
+}
 
 test "NTT" {
     var rnd = RndGen.init(0);
@@ -709,37 +830,15 @@ test "NTT" {
     }
 }
 
-// A vector of K polynomials.
-fn Vec(comptime K: u8) type {
-    return struct {
-        const Self = @This();
-        ps: [K]Poly,
-
-        fn ntt(a: Self) Self {
-            var ret: Self = undefined;
-            comptime var i = 0;
-            inline while (i < K) : (i += 1) {
-                ret.ps[i] = a.ps[i].ntt();
-            }
-            return ret;
+test "Compression" {
+    var rnd = RndGen.init(0);
+    inline for (.{ 1, 4, 5, 10, 11 }) |d| {
+        var k: i32 = 0;
+        while (k <= 1000) : (k += 1) {
+            const p = Poly.randNormalized(&rnd);
+            const pp = p.compress(d);
+            const pq = Poly.decompress(d, pp).compress(d);
+            try testing.expectEqual(pp, pq);
         }
-
-        fn add(a: Self, b: Self) Self {
-            var ret: Self = undefined;
-            comptime var i = 0;
-            inline while (i < K) : (i += 1) {
-                ret.ps[i] = a.ps[i].add(b.ps[i]);
-            }
-            return ret;
-        }
-
-        fn sub(a: Self, b: Self) Self {
-            var ret: Self = undefined;
-            comptime var i = 0;
-            inline while (i < K) : (i += 1) {
-                ret.ps[i] = a.ps[i].sub(b.ps[i]);
-            }
-            return ret;
-        }
-    };
+    }
 }
