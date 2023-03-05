@@ -28,6 +28,24 @@ const Params = struct {
     // How many bits to retain of v, the private-key dependent part
     // of the ciphertext.
     dv: u8,
+
+    // Public key of the inner PKE
+    fn innerPk(comptime p: Params) type {
+        return struct {
+            rho: [32]u8, // ρ, the seed for the matrix A
+            th: Vec(p.k), // NTT(t), normalized
+
+            // Cached values
+            aT: Mat(p.k),
+        };
+    }
+
+    // Private key of the inner PKE
+    fn innerSk(comptime p: Params) type {
+        return struct {
+            sh: Vec(p.k), // NTT(s), normalized
+        };
+    }
 };
 
 const Kyber512: Params = .{
@@ -357,6 +375,8 @@ fn computeZetas() [128]i16 {
 // Coefficients aren't always reduced.  See Normalize().
 const Poly = struct {
     cs: [N]i16,
+
+    const packedSize = N / 2 * 3;
 
     fn add(a: Poly, b: Poly) Poly {
         var ret: Poly = undefined;
@@ -843,6 +863,38 @@ const Poly = struct {
 
         return ret;
     }
+
+    // Packs p.
+    //
+    // Assumes p is normalized (and not just Barrett reduced).
+    fn pack(p: Poly) [packedSize]u8 {
+        var i: usize = 0;
+        var ret: [packedSize]u8 = undefined;
+        while (i < comptime N / 2) : (i += 1) {
+            const t0 = @intCast(u16, p.cs[2 * i]);
+            const t1 = @intCast(u16, p.cs[2 * i + 1]);
+            ret[3 * i] = @truncate(u8, t0);
+            ret[3 * i + 1] = @truncate(u8, (t0 >> 8) | (t1 << 4));
+            ret[3 * i + 2] = @truncate(u8, t1 >> 4);
+        }
+        return ret;
+    }
+
+    // Unpacks a Poly from buf.
+    //
+    // p will not be normalized; instead 0 ≤ p[i] < 4096.
+    fn unpack(buf: [packedSize]u8) Poly {
+        var ret: Poly = undefined;
+        var i: usize = 0;
+        while (i < comptime N / 2) : (i += 1) {
+            const b0 = @as(i16, buf[3 * i]);
+            const b1 = @as(i16, buf[3 * i + 1]);
+            const b2 = @as(i16, buf[3 * i + 2]);
+            ret.cs[2 * i] = b0 | ((b1 & 0xf) << 8);
+            ret.cs[2 * i + 1] = (b1 >> 4) | b2 << 4;
+        }
+        return ret;
+    }
 };
 
 // A vector of K polynomials.
@@ -877,6 +929,14 @@ fn Vec(comptime K: u8) type {
             }
             return ret;
         }
+    };
+}
+
+// A matrix of K vectors
+fn Mat(comptime K: u8) type {
+    return struct {
+        const Self = @This();
+        vs: [K]Vec(K),
     };
 }
 
@@ -1035,4 +1095,14 @@ test "uniform sampling" {
         708,  3117, 154,  1751, 3225, 1364, 154,  23,   2842, 1105, 1419,
         79,   5,    2013,
     });
+}
+
+test "Polynomial packing" {
+    var rnd = RndGen.init(0);
+    var k: i32 = 0;
+
+    while (k <= 1000) : (k += 1) {
+        var p = Poly.randNormalized(&rnd);
+        try testing.expectEqual(Poly.unpack(p.pack()), p);
+    }
 }
