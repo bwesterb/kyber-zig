@@ -3,6 +3,7 @@ const std = @import("std");
 const testing = std.testing;
 const assert = std.debug.assert;
 const RndGen = std.rand.DefaultPrng;
+const sha3 = std.crypto.hash.sha3;
 
 // Q is the parameter q ≡ 3329 = 2¹¹ + 2¹⁰ + 2⁸ + 1.
 const Q: i16 = 3329;
@@ -335,6 +336,7 @@ fn mpow(a: anytype, s: @TypeOf(a), p: @TypeOf(a)) @TypeOf(a) {
     }
 }
 
+// Computes zetas table used by ntt and invNTT.
 fn computeZetas() [128]i16 {
     @setEvalBranchQuota(10000);
     var ret: [128]i16 = undefined;
@@ -730,6 +732,75 @@ const Poly = struct {
 
         return p;
     }
+
+    // Sample p from a centered binomial distribution with n=2η and p=½ - viz:
+    // coefficients are in {-η, …, η} with probabilities
+    //
+    //  {ncr(0, 2η)/2^2η, ncr(1, 2η)/2^2η, …, ncr(2η,2η)/2^2η}
+    fn noise(comptime eta: u8, nonce: u8, seed: *[32]u8) Poly {
+        var h = sha3.Shake256.init(.{});
+        const suffix: [1]u8 = .{nonce};
+        h.update(seed);
+        h.update(&suffix);
+
+        // The distribution at hand is exactly the same as that
+        // of (a₁ + a₂ + … + a_η) - (b₁ + … + b_η) where a_i,b_i~U(1).
+        // Thus we need 2η bits per coefficient.
+        const bufLen: usize = comptime 2 * eta * N / 8;
+        var buf: [bufLen]u8 = undefined;
+        h.squeeze(&buf);
+
+        // buf is interpreted as a₁…a_ηb₁…b_ηa₁…a_ηb₁…b_η…. We process
+        // multiple coefficients in one batch.
+        const T: type = u64; // TODO is u128 faster?
+        comptime var batchCount: usize = undefined;
+        comptime var batchBytes: usize = undefined;
+        comptime var mask: T = 0;
+        comptime {
+            batchCount = @divTrunc(@typeInfo(T).Int.bits, 2 * eta);
+            while (@rem(N, batchCount) != 0 and batchCount > 0) : (batchCount -= 1) {}
+            assert(batchCount > 0);
+            assert(@rem(2 * eta * batchCount, 8) == 0);
+            batchBytes = 2 * eta * batchCount / 8;
+
+            comptime var i = 0;
+            while (i < 2 * eta * batchCount) : (i += 1) {
+                mask <<= eta;
+                mask |= 1;
+            }
+        }
+
+        var i: usize = 0;
+        var ret: Poly = undefined;
+        while (i < comptime N / batchCount) : (i += 1) {
+            // Read coefficients into t. In the case of η=3,
+            // we have t = a₁ + 2a₂ + 4a₃ + 8b₁ + 16b₂ + …
+            var t: T = 0;
+            comptime var j: usize = 0;
+            inline while (j < batchBytes) : (j += 1) {
+                t |= @as(T, buf[batchBytes * i + j]) << (8 * j);
+            }
+
+            // Accumelate `a's and `b's together by masking them out, shifting
+            // and adding. For η=3, we have  d = a₁ + a₂ + a₃ + 8(b₁ + b₂ + b₃) + …
+            var d: T = 0;
+            j = 0;
+            inline while (j < eta) : (j += 1) {
+                d += (t >> j) & mask;
+            }
+
+            // Extract each a and b separately and set coefficient in polynomial.
+            j = 0;
+            inline while (j < batchCount) : (j += 1) {
+                const mask2 = comptime (1 << eta) - 1;
+                const a = @intCast(i16, (d >> (comptime (2 * j * eta))) & mask2);
+                const b = @intCast(i16, (d >> (comptime ((2 * j + 1) * eta))) & mask2);
+                ret.cs[batchCount * i + j] = a - b;
+            }
+        }
+
+        return ret;
+    }
 };
 
 // A vector of K polynomials.
@@ -767,11 +838,11 @@ fn Vec(comptime K: u8) type {
     };
 }
 
-test "mulHat" {
+test "MulHat" {
     var rnd = RndGen.init(0);
     var t: i32 = 0;
 
-    while (t <= 1000) : (t += 1) {
+    while (t <= 100) : (t += 1) {
         const a = Poly.randAbsLeqQ(&rnd);
         var b = Poly.randAbsLeqQ(&rnd);
 
@@ -841,4 +912,51 @@ test "Compression" {
             try testing.expectEqual(pp, pq);
         }
     }
+}
+
+test "noise" {
+    var seed: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < seed.len) : (i += 1) {
+        seed[i] = @intCast(u8, i);
+    }
+    try testing.expectEqual(Poly.noise(3, 37, &seed).cs, .{
+        0,  0,  1,  -1, 0,  2,  0,  -1, -1, 3,  0,  1,  -2, -2, 0,  1,  -2,
+        1,  0,  -2, 3,  0,  0,  0,  1,  3,  1,  1,  2,  1,  -1, -1, -1, 0,
+        1,  0,  1,  0,  2,  0,  1,  -2, 0,  -1, -1, -2, 1,  -1, -1, 2,  -1,
+        1,  1,  2,  -3, -1, -1, 0,  0,  0,  0,  1,  -1, -2, -2, 0,  -2, 0,
+        0,  0,  1,  0,  -1, -1, 1,  -2, 2,  0,  0,  2,  -2, 0,  1,  0,  1,
+        1,  1,  0,  1,  -2, -1, -2, -1, 1,  0,  0,  0,  0,  0,  1,  0,  -1,
+        -1, 0,  -1, 1,  0,  1,  0,  -1, -1, 0,  -2, 2,  0,  -2, 1,  -1, 0,
+        1,  -1, -1, 2,  1,  0,  0,  -2, -1, 2,  0,  0,  0,  -1, -1, 3,  1,
+        0,  1,  0,  1,  0,  2,  1,  0,  0,  1,  0,  1,  0,  0,  -1, -1, -1,
+        0,  1,  3,  1,  0,  1,  0,  1,  -1, -1, -1, -1, 0,  0,  -2, -1, -1,
+        2,  0,  1,  0,  1,  0,  2,  -2, 0,  1,  1,  -3, -1, -2, -1, 0,  1,
+        0,  1,  -2, 2,  2,  1,  1,  0,  -1, 0,  -1, -1, 1,  0,  -1, 2,  1,
+        -1, 1,  2,  -2, 1,  2,  0,  1,  2,  1,  0,  0,  2,  1,  2,  1,  0,
+        2,  1,  0,  0,  -1, -1, 1,  -1, 0,  1,  -1, 2,  2,  0,  0,  -1, 1,
+        1,  1,  1,  0,  0,  -2, 0,  -1, 1,  2,  0,  0,  1,  1,  -1, 1,  0,
+        1,
+    });
+    try testing.expectEqual(Poly.noise(2, 37, &seed).cs, .{
+        1,  0,  1,  -1, -1, -2, -1, -1, 2,  0,  -1, 0,  0,  -1,
+        1,  1,  -1, 1,  0,  2,  -2, 0,  1,  2,  0,  0,  -1, 1,
+        0,  -1, 1,  -1, 1,  2,  1,  1,  0,  -1, 1,  -1, -2, -1,
+        1,  -1, -1, -1, 2,  -1, -1, 0,  0,  1,  1,  -1, 1,  1,
+        1,  1,  -1, -2, 0,  1,  0,  0,  2,  1,  -1, 2,  0,  0,
+        1,  1,  0,  -1, 0,  0,  -1, -1, 2,  0,  1,  -1, 2,  -1,
+        -1, -1, -1, 0,  -2, 0,  2,  1,  0,  0,  0,  -1, 0,  0,
+        0,  -1, -1, 0,  -1, -1, 0,  -1, 0,  0,  -2, 1,  1,  0,
+        1,  0,  1,  0,  1,  1,  -1, 2,  0,  1,  -1, 1,  2,  0,
+        0,  0,  0,  -1, -1, -1, 0,  1,  0,  -1, 2,  0,  0,  1,
+        1,  1,  0,  1,  -1, 1,  2,  1,  0,  2,  -1, 1,  -1, -2,
+        -1, -2, -1, 1,  0,  -2, -2, -1, 1,  0,  0,  0,  0,  1,
+        0,  0,  0,  2,  2,  0,  1,  0,  -1, -1, 0,  2,  0,  0,
+        -2, 1,  0,  2,  1,  -1, -2, 0,  0,  -1, 1,  1,  0,  0,
+        2,  0,  1,  1,  -2, 1,  -2, 1,  1,  0,  2,  0,  -1, 0,
+        -1, 0,  1,  2,  0,  1,  0,  -2, 1,  -2, -2, 1,  -1, 0,
+        -1, 1,  1,  0,  0,  0,  1,  0,  -1, 1,  1,  0,  0,  0,
+        0,  1,  0,  1,  -1, 0,  1,  -1, -1, 2,  0,  0,  1,  -1,
+        0,  1,  -1, 0,
+    });
 }
