@@ -91,7 +91,6 @@
 // - The bottleneck in Kyber are the various hash/xof calls:
 //    - Optimize Zig's keccak implementation.
 //    - Use SIMD to compute keccak in parallel.
-// - Test against NIST's KAT.
 // - Can we track bounds of coefficients using comptime types without
 //   duplicating code?
 // - Figure out how to neatly break long lines.
@@ -122,6 +121,8 @@ const N: i32 = 256;
 const eta2: u8 = 2;
 
 const Params = struct {
+    name: []const u8,
+
     // Width and height of the matrix A.
     k: u8,
 
@@ -138,6 +139,7 @@ const Params = struct {
 };
 
 const Kyber512 = Kyber(.{
+    .name = "Kyber512",
     .k = 2,
     .eta1 = 3,
     .du = 10,
@@ -145,6 +147,7 @@ const Kyber512 = Kyber(.{
 });
 
 const Kyber768 = Kyber(.{
+    .name = "Kyber768",
     .k = 3,
     .eta1 = 2,
     .du = 10,
@@ -152,6 +155,7 @@ const Kyber768 = Kyber(.{
 });
 
 const Kyber1024 = Kyber(.{
+    .name = "Kyber1024",
     .k = 4,
     .eta1 = 2,
     .du = 11,
@@ -174,6 +178,7 @@ fn Kyber(comptime p: Params) type {
         const M = Mat(p.k);
 
         const seedSize: usize = innerSeedSize + sharedKeySize;
+        const name = p.name;
 
         const PublicKey = struct {
             pk: innerPk,
@@ -297,6 +302,9 @@ fn Kyber(comptime p: Params) type {
             // Generate inner key
             innerKeyFromSeed(seed[0..innerSeedSize], &ret.pk.pk, &ret.sk.sk);
             ret.sk.pk = ret.pk.pk;
+
+            // Copy over z from seed.
+            std.mem.copy(u8, &ret.sk.z, seed[innerSeedSize..seedSize]);
 
             // Compute H(pk)
             var h = sha3.Sha3_256.init(.{});
@@ -1664,3 +1672,122 @@ test "Test happy flow" {
         }
     }
 }
+
+// Code to test NIST Known Answer Tests (KAT), see PQCgenKAT.c.
+
+const sha2 = std.crypto.hash.sha2;
+
+test "NIST KAT test" {
+    inline for (.{
+        .{ Kyber512, "e9c2bd37133fcb40772f81559f14b1f58dccd1c816701be9ba6214d43baf4547" },
+        .{ Kyber1024, "89248f2f33f7f4f7051729111f3049c409a933ec904aedadf035f30fa5646cd5" },
+        .{ Kyber768, "a1e122cad3c24bc51622e4c242d8b8acbcd3f618fee4220400605ca8f9ea02c2" },
+    }) |modeHash| {
+        const mode = modeHash[0];
+        var seed: [48]u8 = undefined;
+        var i: usize = 0;
+        while (i < seed.len) : (i += 1) {
+            seed[i] = @intCast(u8, i);
+        }
+        var f = sha2.Sha256.init(.{});
+        var fw = f.writer();
+        var g = NistDRBG.new(&seed);
+        try std.fmt.format(fw, "# {s}\n\n", .{mode.name});
+        i = 0;
+        while (i < 100) : (i += 1) {
+            g.fill(&seed);
+            try std.fmt.format(fw, "count = {}\n", .{i});
+            try std.fmt.format(fw, "seed = {s}\n", .{std.fmt.fmtSliceHexUpper(&seed)});
+            var g2 = NistDRBG.new(&seed);
+
+            // This is not equivalent to g2.fill(kseed[:]).  As the reference
+            // implementation calls randombytes twice generating the keypair,
+            // we have to do that as well.
+            var kseed: [64]u8 = undefined;
+            var eseed: [32]u8 = undefined;
+            g2.fill(kseed[0..32]);
+            g2.fill(kseed[32..64]);
+            g2.fill(&eseed);
+            const kp = mode.keyFromSeed(&kseed);
+            var ct: [mode.ciphertextSize]u8 = undefined;
+            var ss: [sharedKeySize]u8 = undefined;
+            kp.pk.encapsDeterministically(&eseed, &ct, &ss);
+            const ss2 = kp.sk.decaps(&ct);
+            try testing.expectEqual(ss2, ss);
+            try std.fmt.format(fw, "pk = {s}\n", .{std.fmt.fmtSliceHexUpper(&kp.pk.pack())});
+            try std.fmt.format(fw, "sk = {s}\n", .{std.fmt.fmtSliceHexUpper(&kp.sk.pack())});
+            try std.fmt.format(fw, "ct = {s}\n", .{std.fmt.fmtSliceHexUpper(&ct)});
+            try std.fmt.format(fw, "ss = {s}\n\n", .{std.fmt.fmtSliceHexUpper(&ss)});
+        }
+
+        var out: [32]u8 = undefined;
+        f.final(&out);
+        var outHex: [64]u8 = undefined;
+        _ = try std.fmt.bufPrint(&outHex, "{s}", .{std.fmt.fmtSliceHexLower(&out)});
+        try testing.expectEqual(outHex, modeHash[1].*);
+    }
+}
+
+const NistDRBG = struct {
+    key: [32]u8,
+    v: [16]u8,
+
+    fn incV(g: *NistDRBG) void {
+        var j: usize = 15;
+        while (j >= 0) : (j -= 1) {
+            if (g.v[j] == 255) {
+                g.v[j] = 0;
+            } else {
+                g.v[j] += 1;
+                break;
+            }
+        }
+    }
+
+    // AES256_CTR_DRBG_Update(pd, &g.key, &g.v).
+    fn update(g: *NistDRBG, pd: ?*const [48]u8) void {
+        var buf: [48]u8 = undefined;
+        var ctx = std.crypto.core.aes.Aes256.initEnc(g.key);
+        var i: usize = 0;
+        while (i < 3) : (i += 1) {
+            g.incV();
+            var block: [16]u8 = undefined;
+            ctx.encrypt(&block, &g.v);
+            std.mem.copy(u8, buf[i * 16 .. (i + 1) * 16], &block);
+        }
+        if (pd != null) {
+            i = 0;
+            while (i < buf.len) : (i += 1) {
+                buf[i] ^= pd.?[i];
+            }
+        }
+        std.mem.copy(u8, &g.key, buf[0..32]);
+        std.mem.copy(u8, &g.v, buf[32..48]);
+    }
+
+    // randombytes.
+    fn fill(g: *NistDRBG, out: []u8) void {
+        var block: [16]u8 = undefined;
+        var dst = out;
+
+        var ctx = std.crypto.core.aes.Aes256.initEnc(g.key);
+        while (dst.len > 0) {
+            g.incV();
+            ctx.encrypt(&block, &g.v);
+            if (dst.len < 16) {
+                std.mem.copy(u8, dst, block[0..dst.len]);
+                break;
+            }
+            std.mem.copy(u8, dst, &block);
+            dst = dst[16..dst.len];
+        }
+        g.update(null);
+    }
+
+    // randombyte_init(seed, NULL, 256).
+    fn new(seed: *[48]u8) NistDRBG {
+        var ret: NistDRBG = NistDRBG{ .key = .{0} ** 32, .v = .{0} ** 16 };
+        ret.update(seed);
+        return ret;
+    }
+};
