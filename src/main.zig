@@ -84,7 +84,7 @@
 // TODO
 //
 // - API
-// - Test (un)packing
+// - More documentation
 // - We pass amd return rather large structs, like Vec, Mat and PublicKey
 //   by value. Is the compiler clever enough to get rid of all the copies?
 // - Add benchmarks.
@@ -94,6 +94,13 @@
 // - Test against NIST's KAT.
 // - Can we track bounds of coefficients using comptime types without
 //   duplicating code?
+// - Figure out how to neatly break long lines.
+// - test clauses within structs behaved weirdly, they're now moved into the
+//   global scope. Would be neater to have tests closer to the thing under test.
+// - When generating a keypair, we have a copy of the inner public key with
+//   its large matrix A in both the public key and the priovate key. In Go we
+//   can just have a pointer in the private key to the public key, but
+//   how do we do this elegantly in Zig?
 
 const std = @import("std");
 
@@ -210,20 +217,20 @@ fn Kyber(comptime p: Params) type {
                 return pk.pk.pack();
             }
 
-            fn unpack(buf: *const [packedSize]u8) PrivateKey {
+            fn unpack(buf: *const [packedSize]u8) PublicKey {
                 var ret: PublicKey = undefined;
                 ret.pk = innerPk.unpack(buf[0..innerPk.packedSize]);
 
                 var h = sha3.Sha3_256.init(.{});
                 h.update(buf);
-                h.final(ret.hpk);
+                h.final(&ret.hpk);
                 return ret;
             }
         };
 
         const PrivateKey = struct {
             sk: innerSk,
-            pk: *innerPk,
+            pk: innerPk,
             hpk: [hSize]u8, // H(pk)
             z: [sharedKeySize]u8,
 
@@ -249,7 +256,7 @@ fn Kyber(comptime p: Params) type {
                 h.final(kr2[32..64]);
 
                 // Replace K'' by z in the first slot of kr2 if ct ≠ ct'.
-                cmov(32, kr2[0..32], &sk.z, 1 - cteq(ciphertextSize, ct, &ct2));
+                cmov(32, kr2[0..32], &sk.z, cteq(ciphertextSize, ct, &ct2));
 
                 // K = KDF(K''/z, H(c))
                 var kdf = sha3.Shake256.init(.{});
@@ -265,13 +272,14 @@ fn Kyber(comptime p: Params) type {
 
             fn unpack(buf: *const [packedSize]u8) PrivateKey {
                 var ret: PrivateKey = undefined;
-                ret.sk = innerSk.unpack(buf[0..innerSk.packedSize]);
-                var b = buf[innerSk.packedSize..buf.len];
-                ret.pk = innerPk.unpack(b[0..innerPk.packedSize]);
-                b = b[innerPk.packedSized..b.len];
-                std.mem.copy(u8, &ret.hpk, b[0..hSize]);
-                b = b[hSize..b.len];
-                std.mem.copy(u8, &ret.z, b);
+                comptime var s: usize = 0;
+                ret.sk = innerSk.unpack(buf[s .. s + innerSk.packedSize]);
+                s += innerSk.packedSize;
+                ret.pk = innerPk.unpack(buf[s .. s + innerPk.packedSize]);
+                s += innerPk.packedSize;
+                std.mem.copy(u8, &ret.hpk, buf[s .. s + hSize]);
+                s += hSize;
+                std.mem.copy(u8, &ret.z, buf[s .. s + sharedKeySize]);
                 return ret;
             }
         };
@@ -288,11 +296,11 @@ fn Kyber(comptime p: Params) type {
 
             // Generate inner key
             innerKeyFromSeed(seed[0..innerSeedSize], &ret.pk.pk, &ret.sk.sk);
-            ret.sk.pk = &ret.pk.pk;
+            ret.sk.pk = ret.pk.pk;
 
             // Compute H(pk)
             var h = sha3.Sha3_256.init(.{});
-            h.update(&ret.pk.pack());
+            h.update(&ret.pk.pk.pack());
             h.final(&ret.sk.hpk);
             ret.pk.hpk = ret.sk.hpk;
 
@@ -343,7 +351,7 @@ fn Kyber(comptime p: Params) type {
             }
 
             fn unpack(buf: *const [packedSize]u8) innerPk {
-                var ret: innerSk = undefined;
+                var ret: innerPk = undefined;
                 ret.th = V.unpack(buf[0..V.packedSize]).normalize();
                 std.mem.copy(u8, &ret.rho, buf[V.packedSize..packedSize]);
                 ret.aT = M.uniform(&ret.rho, true);
@@ -365,7 +373,7 @@ fn Kyber(comptime p: Params) type {
             }
 
             fn pack(sk: innerSk) [packedSize]u8 {
-                return sk.pack();
+                return sk.sh.pack();
             }
 
             fn unpack(buf: *const [packedSize]u8) innerSk {
@@ -439,6 +447,7 @@ const zetas: [128]i16 = computeZetas();
 // not enough, the other coefficient is reduced as well.
 //
 // This is actually optimal, as proven in https://eprint.iacr.org/2020/1377.pdf
+// TODO generate comptime?
 var invNTTReductions = [_]i16{
     -1, // after layer 1
     -1, // after layer 2
@@ -1369,8 +1378,8 @@ fn Vec(comptime K: u8) type {
 
         fn unpack(buf: *const [packedSize]u8) Self {
             var ret: Self = undefined;
-            var i = 0;
-            while (i < K) : (i += 1) {
+            comptime var i: usize = 0;
+            inline while (i < K) : (i += 1) {
                 ret.ps[i] = Poly.unpack(buf[i * Poly.packedSize .. (i + 1) * Poly.packedSize]);
             }
             return ret;
@@ -1640,13 +1649,17 @@ test "Test happy flow" {
         while (i < 100) : (i += 1) {
             seed[0] = @intCast(u8, i);
             var kp = mode.keyFromSeed(&seed);
+            const sk = mode.PrivateKey.unpack(&kp.sk.pack());
+            try testing.expectEqual(sk, kp.sk);
+            const pk = mode.PublicKey.unpack(&kp.pk.pack());
+            try testing.expectEqual(pk, kp.pk);
             var j: usize = 0;
             while (j < 10) : (j += 1) {
                 seed[1] = @intCast(u8, j);
                 var ct: [mode.ciphertextSize]u8 = undefined;
                 var ss: [mode.sharedKeySize]u8 = undefined;
-                kp.pk.encapsDeterministically(seed[0..32], &ct, &ss);
-                try testing.expectEqual(ss, kp.sk.decaps(&ct));
+                pk.encapsDeterministically(seed[0..32], &ct, &ss);
+                try testing.expectEqual(ss, sk.decaps(&ct));
             }
         }
     }
