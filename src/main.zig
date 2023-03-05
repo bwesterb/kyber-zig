@@ -159,6 +159,10 @@ const Kyber1024 = Kyber(.{
 });
 
 const modes = [_]type{ Kyber512, Kyber768, Kyber1024 };
+const hSize: usize = 32;
+const innerSeedSize: usize = 32;
+const encapsSeedSize: usize = 32;
+const sharedKeySize: usize = 32;
 
 fn Kyber(comptime p: Params) type {
     return struct {
@@ -170,10 +174,6 @@ fn Kyber(comptime p: Params) type {
         const M = Mat(p.k);
 
         const seedSize: usize = innerSeedSize + sharedKeySize;
-        const hSize: usize = 32;
-        const innerSeedSize: usize = 32;
-        const sharedKeySize: usize = 32;
-        const encapsSeedSize: usize = 32;
 
         const PublicKey = struct {
             pk: innerPk,
@@ -1657,7 +1657,7 @@ test "Test happy flow" {
             while (j < 10) : (j += 1) {
                 seed[1] = @intCast(u8, j);
                 var ct: [mode.ciphertextSize]u8 = undefined;
-                var ss: [mode.sharedKeySize]u8 = undefined;
+                var ss: [sharedKeySize]u8 = undefined;
                 pk.encapsDeterministically(seed[0..32], &ct, &ss);
                 try testing.expectEqual(ss, sk.decaps(&ct));
             }
