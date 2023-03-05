@@ -1,3 +1,100 @@
+// Implementation of the IND-CCA2 post-quantum secure key encapsulation
+// mechanism (KEM) CRYSTALS-Kyber, as submitted to the third round of the NIST
+// Post-Quantum Cryptography (v3.02/"draft00"), and selected for standardisation.
+//
+// Kyber will likely change before final standardisation.
+//
+// Quoting from the CFRG I-D:
+//
+// Kyber is not a Diffie-Hellman (DH) style non-interactive key
+// agreement, but instead, Kyber is a Key Encapsulation Method (KEM).
+// In essence, a KEM is a Public-Key Encryption (PKE) scheme where the
+// plaintext cannot be specified, but is generated as a random key as
+// part of the encryption. A KEM can be transformed into an unrestricted
+// PKE using HPKE (RFC9180). On its own, a KEM can be used as a key
+// agreement method in TLS.
+//
+// Kyber is an IND-CCA2 secure KEM.  It is constructed by applying a
+// Fujisaki--Okamato style transformation on InnerPKE, which is the
+// underlying IND-CPA secure Public Key Encryption scheme.  We cannot
+// use InnerPKE directly, as its ciphertexts are malleable.
+//
+//                     F.O. transform
+//     InnerPKE   ---------------------->   Kyber
+//     IND-CPA                              IND-CCA2
+//
+// Kyber is a lattice-based scheme.  More precisely, its security is
+// based on the learning-with-errors-and-rounding problem in module
+// lattices (MLWER).  The underlying polynomial ring R (defined in
+// Section 5) is chosen such that multiplication is very fast using the
+// number theoretic transform (NTT, see Section 5.1.3).
+//
+// An InnerPKE private key is a vector _s_ over R of length k which is
+// _small_ in a particular way.  Here k is a security parameter akin to
+// the size of a prime modulus.  For Kyber512, which targets AES-128's
+// security level, the value of k is 2.
+//
+// The public key consists of two values:
+//
+// *  _A_ a uniformly sampled k by k matrix over R _and_
+//
+// *  _t = A s + e_, where e is a suitably small masking vector.
+//
+// Distinguishing between such A s + e and a uniformly sampled t is the
+// module learning-with-errors (MLWE) problem.  If that is hard, then it
+// is also hard to recover the private key from the public key as that
+// would allow you to distinguish between those two.
+//
+// To save space in the public key, A is recomputed deterministically
+// from a seed _rho_.
+//
+// A ciphertext for a message m under this public key is a pair (c_1,
+// c_2) computed roughly as follows:
+//
+// c_1 = Compress(A^T r + e_1, d_u)
+// c_2 = Compress(t^T r + e_2 + Decompress(m, 1), d_v)
+//
+// where
+//
+// *  e_1, e_2 and r are small blinds;
+//
+// *  Compress(-, d) removes some information, leaving d bits per
+//    coefficient and Decompress is such that Compress after Decompress
+//    does nothing and
+//
+// *  d_u, d_v are scheme parameters.
+//
+// Distinguishing such a ciphertext and uniformly sampled (c_1, c_2) is
+// an example of the full MLWER problem, see section 4.4 of [KyberV302].
+//
+// To decrypt the ciphertext, one computes
+//
+// m = Compress(Decompress(c_2, d_v) - s^T Decompress(c_1, d_u), 1).
+//
+// It it not straight-forward to see that this formula is correct.  In
+// fact, there is negligable but non-zero probability that a ciphertext
+// does not decrypt correctly given by the DFP column in Table 4.  This
+// failure probability can be computed by a careful automated analysis
+// of the probabilities involved, see kyber_failure.py of [SecEst].
+//
+//  [KyberV302] https://pq-crystals.org/kyber/data/kyber-specification-round3-20210804.pdf
+//  [I-D] https://github.com/bwesterb/draft-schwabe-cfrg-kyber
+//  [SecEst] https://github.com/pq-crystals/security-estimates
+
+// TODO
+//
+// - API
+// - Test (un)packing
+// - We pass amd return rather large structs, like Vec, Mat and PublicKey
+//   by value. Is the compiler clever enough to get rid of all the copies?
+// - Add benchmarks.
+// - The bottleneck in Kyber are the various hash/xof calls:
+//    - Optimize Zig's keccak implementation.
+//    - Use SIMD to compute keccak in parallel.
+// - Test against NIST's KAT.
+// - Can we track bounds of coefficients using comptime types without
+//   duplicating code?
+
 const std = @import("std");
 
 const testing = std.testing;
@@ -14,11 +111,14 @@ const R: i32 = 1 << 16;
 // Parameter n, degree of polynomials.
 const N: i32 = 256;
 
+// Size of "small" vectors used in encryption blinds.
+const eta2: u8 = 2;
+
 const Params = struct {
     // Width and height of the matrix A.
     k: u8,
 
-    // Size of "small" vectors used in noise vector for encryption.
+    // Size of "small" vectors used in private key and encryption blinds.
     eta1: u8,
 
     // How many bits to retain of u, the private-key independent part
@@ -28,46 +128,288 @@ const Params = struct {
     // How many bits to retain of v, the private-key dependent part
     // of the ciphertext.
     dv: u8,
-
-    // Public key of the inner PKE
-    fn innerPk(comptime p: Params) type {
-        return struct {
-            rho: [32]u8, // ρ, the seed for the matrix A
-            th: Vec(p.k), // NTT(t), normalized
-
-            // Cached values
-            aT: Mat(p.k),
-        };
-    }
-
-    // Private key of the inner PKE
-    fn innerSk(comptime p: Params) type {
-        return struct {
-            sh: Vec(p.k), // NTT(s), normalized
-        };
-    }
 };
 
-const Kyber512: Params = .{
+const Kyber512 = Kyber(.{
     .k = 2,
     .eta1 = 3,
     .du = 10,
     .dv = 4,
-};
+});
 
-const Kyber768: Params = .{
+const Kyber768 = Kyber(.{
     .k = 3,
     .eta1 = 2,
     .du = 10,
     .dv = 4,
-};
+});
 
-const Kyber1024: Params = .{
+const Kyber1024 = Kyber(.{
     .k = 4,
     .eta1 = 2,
     .du = 11,
     .dv = 5,
-};
+});
+
+const modes = [_]type{ Kyber512, Kyber768, Kyber1024 };
+
+fn Kyber(comptime p: Params) type {
+    return struct {
+        // Size of ciphertexts.
+        const ciphertextSize: usize = Poly.compressedSize(p.du) * p.k + Poly.compressedSize(p.dv);
+
+        const Self = @This();
+        const V = Vec(p.k);
+        const M = Mat(p.k);
+
+        const seedSize: usize = innerSeedSize + sharedKeySize;
+        const hSize: usize = 32;
+        const innerSeedSize: usize = 32;
+        const sharedKeySize: usize = 32;
+        const encapsSeedSize: usize = 32;
+
+        const PublicKey = struct {
+            pk: innerPk,
+
+            // Cached
+            hpk: [hSize]u8, // H(pk)
+
+            const packedSize: usize = innerPk.packedSize;
+
+            // If you're unsure, you should use encaps instead.
+            fn encapsDeterministically(pk: PublicKey, seed: *const [encapsSeedSize]u8, ct: *[ciphertextSize]u8, ss: *[sharedKeySize]u8) void {
+                var m: [innerPlaintextSize]u8 = undefined;
+
+                // m = H(seed)
+                var h = sha3.Sha3_256.init(.{});
+                h.update(seed);
+                h.final(&m);
+
+                // (K', r) = G(m ‖ H(pk))
+                var kr: [innerPlaintextSize + hSize]u8 = undefined;
+                var g = sha3.Sha3_512.init(.{});
+                g.update(&m);
+                g.update(&pk.hpk);
+                g.final(&kr);
+
+                // c = innerEncrypy(pk, m, r)
+                ct.* = pk.pk.encrypt(&m, kr[32..64]);
+
+                // Compute H(c) and put in second slot of kr, which will be (K', H(c)).
+                h = sha3.Sha3_256.init(.{}); // TODO is there an h.reset()?
+                h.update(ct);
+                h.final(kr[32..64]);
+
+                // K = KDF(K' ‖ H(c))
+                var kdf = sha3.Shake256.init(.{});
+                kdf.update(&kr);
+                kdf.squeeze(ss);
+            }
+
+            fn pack(pk: PublicKey) [packedSize]u8 {
+                return pk.pk.pack();
+            }
+
+            fn unpack(buf: *const [packedSize]u8) PrivateKey {
+                var ret: PublicKey = undefined;
+                ret.pk = innerPk.unpack(buf[0..innerPk.packedSize]);
+
+                var h = sha3.Sha3_256.init(.{});
+                h.update(buf);
+                h.final(ret.hpk);
+                return ret;
+            }
+        };
+
+        const PrivateKey = struct {
+            sk: innerSk,
+            pk: *innerPk,
+            hpk: [hSize]u8, // H(pk)
+            z: [sharedKeySize]u8,
+
+            const packedSize: usize = innerSk.packedSize + innerPk.packedSize + hSize + sharedKeySize;
+
+            fn decaps(sk: PrivateKey, ct: *const [ciphertextSize]u8) [sharedKeySize]u8 {
+                // m' = innerDec(ct)
+                const m2 = sk.sk.decrypt(ct);
+
+                // (K'', r') = G(m' ‖ H(pk))
+                var kr2: [64]u8 = undefined;
+                var g = sha3.Sha3_512.init(.{});
+                g.update(&m2);
+                g.update(&sk.hpk);
+                g.final(&kr2);
+
+                // ct' = innerEnc(pk, m', r')
+                const ct2 = sk.pk.encrypt(&m2, kr2[32..64]);
+
+                // Compute H(ct) and put in the second slot of kr2 which will be (K'', H(ct)).
+                var h = sha3.Sha3_256.init(.{});
+                h.update(ct);
+                h.final(kr2[32..64]);
+
+                // Replace K'' by z in the first slot of kr2 if ct ≠ ct'.
+                cmov(32, kr2[0..32], &sk.z, 1 - cteq(ciphertextSize, ct, &ct2));
+
+                // K = KDF(K''/z, H(c))
+                var kdf = sha3.Shake256.init(.{});
+                var ss: [sharedKeySize]u8 = undefined;
+                kdf.update(&kr2);
+                kdf.squeeze(&ss);
+                return ss;
+            }
+
+            fn pack(sk: PrivateKey) [packedSize]u8 {
+                return sk.sk.pack() ++ sk.pk.pack() ++ sk.hpk ++ sk.z;
+            }
+
+            fn unpack(buf: *const [packedSize]u8) PrivateKey {
+                var ret: PrivateKey = undefined;
+                ret.sk = innerSk.unpack(buf[0..innerSk.packedSize]);
+                var b = buf[innerSk.packedSize..buf.len];
+                ret.pk = innerPk.unpack(b[0..innerPk.packedSize]);
+                b = b[innerPk.packedSized..b.len];
+                std.mem.copy(u8, &ret.hpk, b[0..hSize]);
+                b = b[hSize..b.len];
+                std.mem.copy(u8, &ret.z, b);
+                return ret;
+            }
+        };
+
+        const KeyPair = struct {
+            sk: PrivateKey,
+            pk: PublicKey,
+        };
+
+        // Internals below.
+        fn keyFromSeed(seed: *const [seedSize]u8) KeyPair {
+            var ret: KeyPair = undefined;
+            std.mem.copy(u8, &ret.sk.z, seed[innerSeedSize..seedSize]);
+
+            // Generate inner key
+            innerKeyFromSeed(seed[0..innerSeedSize], &ret.pk.pk, &ret.sk.sk);
+            ret.sk.pk = &ret.pk.pk;
+
+            // Compute H(pk)
+            var h = sha3.Sha3_256.init(.{});
+            h.update(&ret.pk.pack());
+            h.final(&ret.sk.hpk);
+            ret.pk.hpk = ret.sk.hpk;
+
+            return ret;
+        }
+
+        // Size of plaintexts of the in
+        const innerPlaintextSize: usize = Poly.compressedSize(1);
+
+        const innerPk = struct {
+            rho: [32]u8, // ρ, the seed for the matrix A
+            th: V, // NTT(t), normalized
+
+            // Cached values
+            aT: M,
+
+            const packedSize: usize = V.packedSize + 32;
+
+            fn encrypt(pk: innerPk, pt: *const [innerPlaintextSize]u8, seed: *const [32]u8) [ciphertextSize]u8 {
+                // Sample r, e₁ and e₂ appropriately
+                const rh = V.noise(p.eta1, 0, seed).ntt().barrettReduce();
+                const e1 = V.noise(eta2, p.k, seed);
+                const e2 = Poly.noise(eta2, 2 * p.k, seed);
+
+                // Next we compute u = Aᵀ r + e₁.  First Aᵀ.
+                var u: V = undefined;
+                var i: usize = 0;
+                while (i < p.k) : (i += 1) {
+                    // Note that coefficients of r are bounded by q and those of Aᵀ
+                    // are bounded by 4.5q and so their product is bounded by 2¹⁵q
+                    // as required for multiplication.
+                    u.ps[i] = pk.aT.vs[i].dotHat(rh);
+                }
+
+                // Aᵀ and r were not in Montgomery form, so the Montgomery
+                // multiplications in the inner product added a factor R⁻¹ which
+                // the InvNTT cancels out.
+                u = u.barrettReduce().invNTT().add(e1).normalize();
+
+                // Next, compute v = <t, r> + e₂ + Decompress_q(m, 1)
+                const v = pk.th.dotHat(rh).barrettReduce().invNTT().add(Poly.decompress(1, pt)).add(e2).normalize();
+
+                return u.compress(p.du) ++ v.compress(p.dv);
+            }
+
+            fn pack(pk: innerPk) [packedSize]u8 {
+                return pk.th.pack() ++ pk.rho;
+            }
+
+            fn unpack(buf: *const [packedSize]u8) innerPk {
+                var ret: innerSk = undefined;
+                ret.th = V.unpack(buf[0..V.packedSize]).normalize();
+                std.mem.copy(u8, &ret.rho, buf[V.packedSize..packedSize]);
+                ret.aT = M.uniform(&ret.rho, true);
+                return ret;
+            }
+        };
+
+        // Private key of the inner PKE
+        const innerSk = struct {
+            sh: V, // NTT(s), normalized
+            const packedSize = V.packedSize;
+
+            fn decrypt(sk: innerSk, ct: *const [ciphertextSize]u8) [innerPlaintextSize]u8 {
+                const u = V.decompress(p.du, ct[0..comptime V.compressedSize(p.du)]);
+                const v = Poly.decompress(p.dv, ct[comptime V.compressedSize(p.du)..ciphertextSize]);
+
+                // Compute m = v - <s, u>
+                return v.sub(sk.sh.dotHat(u.ntt()).barrettReduce().invNTT()).normalize().compress(1);
+            }
+
+            fn pack(sk: innerSk) [packedSize]u8 {
+                return sk.pack();
+            }
+
+            fn unpack(buf: *const [packedSize]u8) innerSk {
+                var ret: innerSk = undefined;
+                ret.sh = V.unpack(buf).normalize();
+                return ret;
+            }
+        };
+
+        // Derives inner PKE keypair from given seed.
+        fn innerKeyFromSeed(seed: *const [innerSeedSize]u8, pk: *innerPk, sk: *innerSk) void {
+            var expandedSeed: [64]u8 = undefined;
+
+            var h = sha3.Sha3_512.init(.{});
+            h.update(seed);
+            h.final(&expandedSeed);
+            std.mem.copy(u8, &pk.rho, expandedSeed[0..32]);
+            const sigma = expandedSeed[32..64];
+            pk.aT = M.uniform(&pk.rho, false); // Expand ρ to A; we'll transpose later on
+
+            // Sample secret vector s.
+            sk.sh = V.noise(p.eta1, 0, sigma).ntt().normalize();
+
+            const eh = Vec(p.k).noise(p.eta1, p.k, sigma).ntt(); // sample blind e.
+            var th: V = undefined;
+
+            // Next, we compute t = A s + e.
+            var i: usize = 0;
+            while (i < p.k) : (i += 1) {
+                // Note that coefficients of s are bounded by q and those of A
+                // are bounded by 4.5q and so their product is bounded by 2¹⁵q
+                // as required for multiplication.
+                // A and s were not in Montgomery form, so the Montgomery
+                // multiplications in the inner product added a factor R⁻¹ which
+                // we'll cancel out with toMont().  This will also ensure the
+                // coefficients of th are bounded in absolute value by q.
+                th.ps[i] = pk.aT.vs[i].dotHat(sk.sh).toMont();
+            }
+
+            pk.th = th.add(eh).normalize(); // bounded by 8q
+            pk.aT = pk.aT.T();
+        }
+    };
+}
 
 // R mod q
 const RModQ: i32 = @rem(@as(i32, R), Q);
@@ -377,10 +719,11 @@ const Poly = struct {
     cs: [N]i16,
 
     const packedSize = N / 2 * 3;
+    const zero: Poly = .{ .cs = .{0} ** N };
 
     fn add(a: Poly, b: Poly) Poly {
         var ret: Poly = undefined;
-        var i = 0;
+        var i: usize = 0;
         while (i < N) : (i += 1) {
             ret.cs[i] = a.cs[i] + b.cs[i];
         }
@@ -389,7 +732,7 @@ const Poly = struct {
 
     fn sub(a: Poly, b: Poly) Poly {
         var ret: Poly = undefined;
-        var i = 0;
+        var i: usize = 0;
         while (i < N) : (i += 1) {
             ret.cs[i] = a.cs[i] - b.cs[i];
         }
@@ -597,10 +940,14 @@ const Poly = struct {
         return ret;
     }
 
+    fn compressedSize(comptime d: u8) usize {
+        return @divTrunc(N * d, 8);
+    }
+
     // Returns packed Compress_q(p, d).
     //
     // Assumes p is normalized.
-    fn compress(p: Poly, comptime d: u8) [@divTrunc(N * d, 8)]u8 {
+    fn compress(p: Poly, comptime d: u8) [compressedSize(d)]u8 {
         @setEvalBranchQuota(10000);
         const Qover2: u32 = comptime @divTrunc(Q, 2); // (q-1)/2
         const twoDm1: u32 = comptime (1 << d) - 1; // 2ᵈ-1
@@ -657,7 +1004,7 @@ const Poly = struct {
     }
 
     // Set p to Decompress_q(m, d).
-    fn decompress(comptime d: u8, in: [@divTrunc(N * d, 8)]u8) Poly {
+    fn decompress(comptime d: u8, in: *const [compressedSize(d)]u8) Poly {
         @setEvalBranchQuota(10000);
         const inLen: usize = comptime @divTrunc(N * d, 8);
         comptime assert(inLen * 8 == d * N);
@@ -757,7 +1104,7 @@ const Poly = struct {
     // coefficients are in {-η, …, η} with probabilities
     //
     //  {ncr(0, 2η)/2^2η, ncr(1, 2η)/2^2η, …, ncr(2η,2η)/2^2η}
-    fn noise(comptime eta: u8, nonce: u8, seed: *[32]u8) Poly {
+    fn noise(comptime eta: u8, nonce: u8, seed: *const [32]u8) Poly {
         var h = sha3.Shake256.init(.{});
         const suffix: [1]u8 = .{nonce};
         h.update(seed);
@@ -823,7 +1170,7 @@ const Poly = struct {
     }
 
     // Sample p uniformly from the given seed and x and y coordinates.
-    fn uniform(seed: *[32]u8, x: u8, y: u8) Poly {
+    fn uniform(seed: *const [32]u8, x: u8, y: u8) Poly {
         var h = sha3.Shake128.init(.{});
         const suffix: [2]u8 = .{ x, y };
         h.update(seed);
@@ -883,7 +1230,7 @@ const Poly = struct {
     // Unpacks a Poly from buf.
     //
     // p will not be normalized; instead 0 ≤ p[i] < 4096.
-    fn unpack(buf: [packedSize]u8) Poly {
+    fn unpack(buf: *const [packedSize]u8) Poly {
         var ret: Poly = undefined;
         var i: usize = 0;
         while (i < comptime N / 2) : (i += 1) {
@@ -900,21 +1247,54 @@ const Poly = struct {
 // A vector of K polynomials.
 fn Vec(comptime K: u8) type {
     return struct {
-        const Self = @This();
         ps: [K]Poly,
+
+        const Self = @This();
+        const packedSize = K * Poly.packedSize;
+
+        fn compressedSize(comptime d: u8) usize {
+            return Poly.compressedSize(d) * K;
+        }
 
         fn ntt(a: Self) Self {
             var ret: Self = undefined;
-            var i = 0;
+            var i: usize = 0;
             while (i < K) : (i += 1) {
                 ret.ps[i] = a.ps[i].ntt();
             }
             return ret;
         }
 
+        fn invNTT(a: Self) Self {
+            var ret: Self = undefined;
+            var i: usize = 0;
+            while (i < K) : (i += 1) {
+                ret.ps[i] = a.ps[i].invNTT();
+            }
+            return ret;
+        }
+
+        fn normalize(a: Self) Self {
+            var ret: Self = undefined;
+            var i: usize = 0;
+            while (i < K) : (i += 1) {
+                ret.ps[i] = a.ps[i].normalize();
+            }
+            return ret;
+        }
+
+        fn barrettReduce(a: Self) Self {
+            var ret: Self = undefined;
+            var i: usize = 0;
+            while (i < K) : (i += 1) {
+                ret.ps[i] = a.ps[i].barrettReduce();
+            }
+            return ret;
+        }
+
         fn add(a: Self, b: Self) Self {
             var ret: Self = undefined;
-            var i = 0;
+            var i: usize = 0;
             while (i < K) : (i += 1) {
                 ret.ps[i] = a.ps[i].add(b.ps[i]);
             }
@@ -923,9 +1303,75 @@ fn Vec(comptime K: u8) type {
 
         fn sub(a: Self, b: Self) Self {
             var ret: Self = undefined;
-            var i = 0;
+            var i: usize = 0;
             while (i < K) : (i += 1) {
                 ret.ps[i] = a.ps[i].sub(b.ps[i]);
+            }
+            return ret;
+        }
+
+        // Samples v[i] from centered binomial distribution with the given η,
+        // seed and nonce+i.
+        fn noise(comptime eta: u8, nonce: u8, seed: *const [32]u8) Self {
+            var ret: Self = undefined;
+            var i: u8 = 0;
+            while (i < K) : (i += 1) {
+                ret.ps[i] = Poly.noise(eta, nonce + i, seed);
+            }
+            return ret;
+        }
+
+        // Sets p to the inner product of a and b using "pointwise" multiplication.
+        //
+        // See MulHat() and NTT() for a description of the multiplication.
+        // Assumes a and b are in Montgomery form.  p will be in Montgomery form,
+        // and its coefficients will be bounded in absolute value by 2kq.
+        // If a and b are not in Montgomery form, then the action is the same
+        // as "pointwise" multiplication followed by multiplying by R⁻¹, the inverse
+        // of the Montgomery factor.
+        fn dotHat(a: Self, b: Self) Poly {
+            var ret: Poly = Poly.zero;
+            var i: usize = 0;
+            while (i < K) : (i += 1) {
+                ret = ret.add(a.ps[i].mulHat(b.ps[i]));
+            }
+            return ret;
+        }
+
+        fn compress(v: Self, comptime d: u8) [compressedSize(d)]u8 {
+            const cs = comptime Poly.compressedSize(d);
+            var ret: [compressedSize(d)]u8 = undefined;
+            var i: usize = 0;
+            while (i < K) : (i += 1) {
+                std.mem.copy(u8, ret[i * cs .. (i + 1) * cs], &v.ps[i].compress(d));
+            }
+            return ret;
+        }
+
+        fn decompress(comptime d: u8, buf: *const [compressedSize(d)]u8) Self {
+            const cs = comptime Poly.compressedSize(d);
+            var ret: Self = undefined;
+            comptime var i: usize = 0;
+            inline while (i < K) : (i += 1) {
+                ret.ps[i] = Poly.decompress(d, buf[i * cs .. (i + 1) * cs]);
+            }
+            return ret;
+        }
+
+        fn pack(v: Self) [packedSize]u8 {
+            var ret: [packedSize]u8 = undefined;
+            comptime var i = 0;
+            inline while (i < K) : (i += 1) {
+                std.mem.copy(u8, ret[i * Poly.packedSize .. (i + 1) * Poly.packedSize], &v.ps[i].pack());
+            }
+            return ret;
+        }
+
+        fn unpack(buf: *const [packedSize]u8) Self {
+            var ret: Self = undefined;
+            var i = 0;
+            while (i < K) : (i += 1) {
+                ret.ps[i] = Poly.unpack(buf[i * Poly.packedSize .. (i + 1) * Poly.packedSize]);
             }
             return ret;
         }
@@ -937,7 +1383,59 @@ fn Mat(comptime K: u8) type {
     return struct {
         const Self = @This();
         vs: [K]Vec(K),
+
+        fn uniform(seed: *const [32]u8, comptime transpose: bool) Self {
+            var ret: Self = undefined;
+            var i: u8 = 0;
+            while (i < K) : (i += 1) {
+                var j: u8 = 0;
+                while (j < K) : (j += 1) {
+                    ret.vs[i].ps[j] = Poly.uniform(
+                        seed,
+                        if (transpose) i else j,
+                        if (transpose) j else i,
+                    );
+                }
+            }
+            return ret;
+        }
+
+        // Returns transpose of A
+        fn T(m: Self) Self {
+            var i: usize = 0;
+            var ret: Self = undefined;
+            while (i < K) : (i += 1) {
+                var j: usize = 0;
+                while (j < K) : (j += 1) {
+                    ret.vs[i].ps[j] = m.vs[j].ps[i];
+                }
+            }
+            return ret;
+        }
     };
+}
+
+// Returns 0 if a = b and 1 otherwise.
+fn cteq(comptime len: usize, a: *const [len]u8, b: *const [len]u8) usize {
+    // TODO Is there an existing function in the stdlib for this?
+    var i: usize = 0;
+    var ret: u8 = 0;
+    while (i < len) : (i += 1) {
+        ret |= a[i] ^ b[i];
+    }
+    return @bitCast(usize, -@as(isize, ret)) >> (@typeInfo(usize).Int.bits - 1);
+}
+
+// Copy src into dst given b = 1.
+//
+// Assumes b is either 0 or 1.
+fn cmov(comptime len: usize, dst: *[len]u8, src: *const [len]u8, b: usize) void {
+    // TODO Is there an existing function in the stdlib for this?
+    const mask = @bitCast(u8, -@intCast(i8, b));
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        dst[i] ^= mask & (dst[i] ^ src[i]);
+    }
 }
 
 test "MulHat" {
@@ -1010,7 +1508,7 @@ test "Compression" {
         while (k <= 1000) : (k += 1) {
             const p = Poly.randNormalized(&rnd);
             const pp = p.compress(d);
-            const pq = Poly.decompress(d, pp).compress(d);
+            const pq = Poly.decompress(d, &pp).compress(d);
             try testing.expectEqual(pp, pq);
         }
     }
@@ -1103,6 +1601,53 @@ test "Polynomial packing" {
 
     while (k <= 1000) : (k += 1) {
         var p = Poly.randNormalized(&rnd);
-        try testing.expectEqual(Poly.unpack(p.pack()), p);
+        try testing.expectEqual(Poly.unpack(&p.pack()), p);
+    }
+}
+
+test "Test inner PKE" {
+    var seed: [32]u8 = undefined;
+    var pt: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < seed.len) : (i += 1) {
+        seed[i] = @intCast(u8, i);
+        pt[i] = @intCast(u8, i + 32);
+    }
+    inline for (modes) |mode| {
+        i = 0;
+        while (i < 100) : (i += 1) {
+            var pk: mode.innerPk = undefined;
+            var sk: mode.innerSk = undefined;
+            seed[0] = @intCast(u8, i);
+            mode.innerKeyFromSeed(&seed, &pk, &sk);
+            var j: usize = 0;
+            while (j < 10) : (j += 1) {
+                seed[1] = @intCast(u8, j);
+                try testing.expectEqual(sk.decrypt(&pk.encrypt(&pt, &seed)), pt);
+            }
+        }
+    }
+}
+
+test "Test happy flow" {
+    var seed: [64]u8 = undefined;
+    var i: usize = 0;
+    while (i < seed.len) : (i += 1) {
+        seed[i] = @intCast(u8, i);
+    }
+    inline for (modes) |mode| {
+        i = 0;
+        while (i < 100) : (i += 1) {
+            seed[0] = @intCast(u8, i);
+            var kp = mode.keyFromSeed(&seed);
+            var j: usize = 0;
+            while (j < 10) : (j += 1) {
+                seed[1] = @intCast(u8, j);
+                var ct: [mode.ciphertextSize]u8 = undefined;
+                var ss: [mode.sharedKeySize]u8 = undefined;
+                kp.pk.encapsDeterministically(seed[0..32], &ct, &ss);
+                try testing.expectEqual(ss, kp.sk.decaps(&ct));
+            }
+        }
     }
 }
