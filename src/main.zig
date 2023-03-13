@@ -85,7 +85,7 @@
 //
 // - API
 // - More documentation
-// - We pass amd return rather large structs, like Vec, Mat and PublicKey
+// - We pass and return rather large structs, like Vec, Mat and PublicKey
 //   by value. Is the compiler clever enough to get rid of all the copies?
 // - Add benchmarks.
 // - The bottleneck in Kyber are the various hash/xof calls:
@@ -138,7 +138,7 @@ const Params = struct {
     dv: u8,
 };
 
-const Kyber512 = Kyber(.{
+pub const Kyber512 = Kyber(.{
     .name = "Kyber512",
     .k = 2,
     .eta1 = 3,
@@ -146,7 +146,7 @@ const Kyber512 = Kyber(.{
     .dv = 4,
 });
 
-const Kyber768 = Kyber(.{
+pub const Kyber768 = Kyber(.{
     .name = "Kyber768",
     .k = 3,
     .eta1 = 2,
@@ -154,7 +154,7 @@ const Kyber768 = Kyber(.{
     .dv = 4,
 });
 
-const Kyber1024 = Kyber(.{
+pub const Kyber1024 = Kyber(.{
     .name = "Kyber1024",
     .k = 4,
     .eta1 = 2,
@@ -165,20 +165,22 @@ const Kyber1024 = Kyber(.{
 const modes = [_]type{ Kyber512, Kyber768, Kyber1024 };
 const hSize: usize = 32;
 const innerSeedSize: usize = 32;
-const encapsSeedSize: usize = 32;
-const sharedKeySize: usize = 32;
+const commonEncapsSeedSize: usize = 32;
+const commonSharedKeySize: usize = 32;
 
 fn Kyber(comptime p: Params) type {
     return struct {
         // Size of ciphertexts.
-        const ciphertextSize: usize = Poly.compressedSize(p.du) * p.k + Poly.compressedSize(p.dv);
+        pub const ciphertextSize: usize = Poly.compressedSize(p.du) * p.k + Poly.compressedSize(p.dv);
 
         const Self = @This();
         const V = Vec(p.k);
         const M = Mat(p.k);
 
-        const seedSize: usize = innerSeedSize + sharedKeySize;
-        const name = p.name;
+        pub const sharedKeySize = commonSharedKeySize;
+        pub const encapsSeedSize = commonEncapsSeedSize;
+        pub const seedSize: usize = innerSeedSize + sharedKeySize;
+        pub const name = p.name;
 
         const PublicKey = struct {
             pk: innerPk,
@@ -186,10 +188,18 @@ fn Kyber(comptime p: Params) type {
             // Cached
             hpk: [hSize]u8, // H(pk)
 
-            const packedSize: usize = innerPk.packedSize;
+            pub const packedSize: usize = innerPk.packedSize;
 
-            // If you're unsure, you should use encaps instead.
-            fn encapsDeterministically(pk: PublicKey, seed: *const [encapsSeedSize]u8, ct: *[ciphertextSize]u8, ss: *[sharedKeySize]u8) void {
+            /// Generates a shared secret, written to ss, and encapsulates
+            /// it for public key, written to ct.
+            pub fn encaps(pk: PublicKey, ct: *[ciphertextSize]u8, ss: *[sharedKeySize]u8) void {
+                var seed: [encapsSeedSize]u8 = undefined;
+                std.crypto.random.bytes(&seed);
+                return encapsDeterministically(pk, &seed, ct, ss);
+            }
+
+            /// If you're unsure, you should use encaps instead.
+            pub fn encapsDeterministically(pk: PublicKey, seed: *const [encapsSeedSize]u8, ct: *[ciphertextSize]u8, ss: *[sharedKeySize]u8) void {
                 var m: [innerPlaintextSize]u8 = undefined;
 
                 // m = H(seed)
@@ -218,11 +228,11 @@ fn Kyber(comptime p: Params) type {
                 kdf.squeeze(ss);
             }
 
-            fn pack(pk: PublicKey) [packedSize]u8 {
+            pub fn pack(pk: PublicKey) [packedSize]u8 {
                 return pk.pk.pack();
             }
 
-            fn unpack(buf: *const [packedSize]u8) PublicKey {
+            pub fn unpack(buf: *const [packedSize]u8) PublicKey {
                 var ret: PublicKey = undefined;
                 ret.pk = innerPk.unpack(buf[0..innerPk.packedSize]);
 
@@ -239,9 +249,10 @@ fn Kyber(comptime p: Params) type {
             hpk: [hSize]u8, // H(pk)
             z: [sharedKeySize]u8,
 
-            const packedSize: usize = innerSk.packedSize + innerPk.packedSize + hSize + sharedKeySize;
+            pub const packedSize: usize = innerSk.packedSize + innerPk.packedSize + hSize + sharedKeySize;
 
-            fn decaps(sk: PrivateKey, ct: *const [ciphertextSize]u8) [sharedKeySize]u8 {
+            /// Decapsulates the shared secret within ct using the private key.
+            pub fn decaps(sk: PrivateKey, ct: *const [ciphertextSize]u8) [sharedKeySize]u8 {
                 // m' = innerDec(ct)
                 const m2 = sk.sk.decrypt(ct);
 
@@ -271,11 +282,11 @@ fn Kyber(comptime p: Params) type {
                 return ss;
             }
 
-            fn pack(sk: PrivateKey) [packedSize]u8 {
+            pub fn pack(sk: PrivateKey) [packedSize]u8 {
                 return sk.sk.pack() ++ sk.pk.pack() ++ sk.hpk ++ sk.z;
             }
 
-            fn unpack(buf: *const [packedSize]u8) PrivateKey {
+            pub fn unpack(buf: *const [packedSize]u8) PrivateKey {
                 var ret: PrivateKey = undefined;
                 comptime var s: usize = 0;
                 ret.sk = innerSk.unpack(buf[s .. s + innerSk.packedSize]);
@@ -294,8 +305,16 @@ fn Kyber(comptime p: Params) type {
             pk: PublicKey,
         };
 
-        // Internals below.
-        fn keyFromSeed(seed: *const [seedSize]u8) KeyPair {
+        /// Generates a new random keypair.
+        pub fn genKey() KeyPair {
+            var seed: [seedSize]u8 = undefined;
+            std.crypto.random.bytes(&seed);
+            return keyFromSeed(&seed);
+        }
+
+        /// Derives a keypair from a seed. If you're unsure, you should use
+        /// genKey() instead.
+        pub fn keyFromSeed(seed: *const [seedSize]u8) KeyPair {
             var ret: KeyPair = undefined;
             std.mem.copy(u8, &ret.sk.z, seed[innerSeedSize..seedSize]);
 
@@ -1665,7 +1684,7 @@ test "Test happy flow" {
             while (j < 10) : (j += 1) {
                 seed[1] = @intCast(u8, j);
                 var ct: [mode.ciphertextSize]u8 = undefined;
-                var ss: [sharedKeySize]u8 = undefined;
+                var ss: [mode.sharedKeySize]u8 = undefined;
                 pk.encapsDeterministically(seed[0..32], &ct, &ss);
                 try testing.expectEqual(ss, sk.decaps(&ct));
             }
@@ -1710,7 +1729,7 @@ test "NIST KAT test" {
             g2.fill(&eseed);
             const kp = mode.keyFromSeed(&kseed);
             var ct: [mode.ciphertextSize]u8 = undefined;
-            var ss: [sharedKeySize]u8 = undefined;
+            var ss: [mode.sharedKeySize]u8 = undefined;
             kp.pk.encapsDeterministically(&eseed, &ct, &ss);
             const ss2 = kp.sk.decaps(&ct);
             try testing.expectEqual(ss2, ss);
